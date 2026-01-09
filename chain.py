@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Any
 import os
 
 from langchain_core.documents import Document
@@ -10,92 +10,74 @@ from prompt import SYSTEM_PROMPT, USER_PROMPT
 from session_memory import SessionMemory
 from vectorstore import get_vectorstore
 
-
-# Global store for session memories
+# -------------------- Session Store --------------------
 session_memories: Dict[str, SessionMemory] = {}
 
-
 def get_session_memory(session_id: str) -> SessionMemory:
-    """
-    Get or create a SessionMemory for the given session_id.
-    """
     if session_id not in session_memories:
         session_memories[session_id] = SessionMemory()
     return session_memories[session_id]
 
-
-def _get_llm():
-    """
-    Select LLM based on environment:
-    - LLM_PROVIDER=groq -> Groq Chat model (requires GROQ_API_KEY)
-    - otherwise uses local Ollama
-    """
+# -------------------- LLM Selector --------------------
+def get_llm():
     provider = os.getenv("LLM_PROVIDER", "ollama").lower()
-
     if provider == "groq":
         model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         return ChatGroq(model=model)
+    return Ollama(model=os.getenv("OLLAMA_MODEL", "llama2"))
 
-    # Default: Ollama
-    ollama_model = os.getenv("OLLAMA_MODEL", "llama2")
-    return Ollama(model=ollama_model)
-
-
-def get_rag_chain(session_id: str) -> RunnableLambda:
+# -------------------- RAG Chain --------------------
+def get_rag_chain(session_id: str) -> RunnableLambda[Dict[str, str], Dict[str, Any]]:
     """
-    Assemble and return the RAG chain for the given session_id using LCEL.
-    Components: Retriever, Prompt, LLM, Memory.
+    Returns a RunnableLambda that takes {"question": str} and returns:
+        {
+            "answer": str,
+            "retrieved_chunks": List[Dict[str, Any]]
+        }
     """
-    # Vectorstore for similarity search with scores
     vectorstore = get_vectorstore()
+    llm = get_llm()
 
-    # LLM (Ollama or Groq, depending on env)
-    llm = _get_llm()
-
-    # Chain using LCEL
-    def format_docs(docs: List[Document]) -> str:
-        return "\n\n".join(doc.page_content for doc in docs)
-
-    def chat_flow(input_dict: dict[str, str]):
+    def chat_flow(input_dict: Dict[str, str]) -> Dict[str, Any]:
         question = input_dict.get("question", "")
-        session_memory = get_session_memory(session_id)
+        memory = get_session_memory(session_id)
 
-        # Fetch chat history
-        chat_history = session_memory.get_formatted_history()
+        # -------------------- Retrieve relevant chunks --------------------
+        docs_with_scores = vectorstore.similarity_search_with_score(question, k=4)
 
-        # Create enhanced query
-        enhanced_query = f"Conversation so far:\n{chat_history}\n\nUser question:\n{question}"
+        docs: List[Document] = [doc for doc, score in docs_with_scores]
 
-        # Retrieve documents with scores
-        docs_with_scores = vectorstore.similarity_search_with_score(enhanced_query, k=4)
+        # Format context for LLM
+        context = "\n\n".join(doc.page_content for doc in docs)
 
-        # Extract docs and add similarity scores to metadata
-        docs = []
-        retrieved_chunks = []
-        for doc, score in docs_with_scores:
-            doc.metadata["similarity_score"] = score
-            docs.append(doc)
-            retrieved_chunks.append({
+        # -------------------- Build Prompt --------------------
+        prompt = f"""
+{SYSTEM_PROMPT}
+
+{USER_PROMPT.format(context=context, question=question)}
+"""
+
+        # -------------------- Call LLM --------------------
+        answer = llm.invoke(prompt)
+        answer_text = getattr(answer, "content", str(answer))
+
+        # -------------------- Store in Session Memory --------------------
+        memory.add_turn(question, answer_text)
+
+        # -------------------- Prepare retrieved chunks --------------------
+        retrieved_chunks = [
+            {
                 "text": doc.page_content,
                 "source": doc.metadata.get("source", ""),
                 "chunk_id": doc.metadata.get("chunk_id", ""),
                 "similarity_score": score
-            })
+            }
+            for doc, score in docs_with_scores
+        ]
 
-        # Combine into context string
-        context = format_docs(docs)
-
-        # Create prompt
-        prompt = f"{SYSTEM_PROMPT}\n\n{USER_PROMPT.format(context=context, question=question)}"
-
-        # Stream LLM response
-        full_response = ""
-        for chunk in llm.stream(prompt):
-            chunk_text = str(chunk)
-            full_response += chunk_text
-            yield chunk_text
-
-        # Store in SessionMemory after streaming completes
-        session_memory.add_turn(question, full_response)
+        return {
+            "answer": answer_text,
+            "retrieved_chunks": retrieved_chunks
+        }
 
     return RunnableLambda(chat_flow)

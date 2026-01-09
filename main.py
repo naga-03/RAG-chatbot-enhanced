@@ -1,10 +1,12 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI
 from typing import List
 import os
 import shutil
 
+from chain import get_rag_chain
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
@@ -35,10 +37,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def serve_frontend():
+@app.get("/{full_path:path}")
+async def serve_frontend(full_path: str):
+    if full_path.startswith(("health", "upload", "chat")):
+        return JSONResponse(status_code=404, content={"error": "Not found"})
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    index_path = os.path.join(base_dir, "frontend", "index.html")
+    index_path = os.path.join(base_dir, "frontend", "public", "index.html")
     return FileResponse(index_path)
 
 @app.get("/health")
@@ -58,10 +62,23 @@ async def upload_files(files: List[UploadFile] = File(...)) -> JSONResponse:
 
             with open(temp_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
+            print(f"[UPLOAD] Saved temp file: {temp_path}")
 
+            # Load document
             documents = load_document(temp_path)
+            print(f"[UPLOAD] Loaded documents: {len(documents)}")
+            if not documents:
+                return JSONResponse(status_code=400, content={"error": "Failed to load document"})
+
+            # Chunk documents
             chunks = chunk_documents(documents)
+            print(f"[UPLOAD] Generated chunks: {len(chunks)}")
+            if not chunks:
+                return JSONResponse(status_code=400, content={"error": "No chunks generated"})
+
+            # Store chunks
             store_chunks(chunks, filename)
+            print(f"[UPLOAD] Stored chunks in vectorstore")
 
             uploaded_files.append(filename)
 
@@ -69,32 +86,14 @@ async def upload_files(files: List[UploadFile] = File(...)) -> JSONResponse:
             content={"message": "Files uploaded and processed", "files": uploaded_files}
         )
 
-    except ValueError as e:
-        # Unsupported file type
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Unsupported file type: {str(e)}"}
-        )
-    except RuntimeError as e:
-        # Missing environment variables or Pinecone issues
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Server configuration error: {str(e)}"}
-        )
     except Exception as e:
-        # General error
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Upload failed: {str(e)}"}
-        )
+        print(f"[UPLOAD] Error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
     finally:
-        # Clean up temp files
         for temp_path in temp_files:
             if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass  # Ignore cleanup errors
+                os.remove(temp_path)
 
 @app.post("/chat")
 async def chat(request: ChatRequest) -> JSONResponse:
@@ -106,12 +105,19 @@ async def chat(request: ChatRequest) -> JSONResponse:
     # Process the query through the chain
     result = chain.invoke({"question": request.query})
 
+    # Extract answer text
+    answer_text = result.get("answer", "")
+    
+    # Extract retrieved chunks properly
+    retrieved_chunks = result.get("retrieved_chunks", [])
+    serializable_chunks = [chunk["text"] for chunk in retrieved_chunks]
+
     return JSONResponse(
         content={
-            "answer": result["answer"],
+            "answer": answer_text,
             "metadata": {
                 "language": language,
-                "retrieved_chunks": result["retrieved_chunks"],
+                "retrieved_chunks": serializable_chunks,
             }
         }
     )

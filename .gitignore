@@ -4,3 +4,21 @@
 __pycache__/
 *.pyc
 venv/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+
+# Node / React
+node_modules/
+build/
+dist/
+
+# OS
+.DS_Store
+
+# Temp files
+temp_*
